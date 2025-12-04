@@ -1,114 +1,122 @@
-import express from "express";
-import bodyParser from "body-parser";
-import fetch from "node-fetch";
-import ffmpeg from "fluent-ffmpeg";
-import ffmpegPath from "ffmpeg-static";
-import { promises as fs } from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
-import crypto from "crypto";
+// server.js
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const express = require("express");
+const cors = require("cors");
+const fs = require("fs");
+const path = require("path");
+const { promisify } = require("util");
+const { execFile } = require("child_process");
 
-ffmpeg.setFfmpegPath(ffmpegPath);
+// node-fetch ESM shim
+const fetch = (...args) =>
+  import("node-fetch").then(({ default: fetch }) => fetch(...args));
+
+const execFileAsync = promisify(execFile);
 
 const app = express();
-app.use(bodyParser.json());
 
-// In-memory map of id -> file path in /tmp
-const videoStore = new Map();
+// Allow browser requests
+app.use(cors());
+app.use(express.json());
 
-/**
- * POST /process
- * Body: { video_url: string, prediction_id?: string }
- * Returns: { success: boolean, fixed_url?: string, error?: string }
- */
+// Where we store transcoded videos on disk
+const OUTPUT_DIR = path.join(__dirname, "videos");
+if (!fs.existsSync(OUTPUT_DIR)) {
+  fs.mkdirSync(OUTPUT_DIR);
+}
+
+// Helper: download a remote file to disk
+async function downloadFile(url, destPath) {
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Download failed: ${res.status} ${res.statusText}`);
+  }
+
+  return new Promise((resolve, reject) => {
+    const fileStream = fs.createWriteStream(destPath);
+    res.body.pipe(fileStream);
+    res.body.on("error", reject);
+    fileStream.on("finish", resolve);
+  });
+}
+
+// POST /process  ->  { video_url, prediction_id }
 app.post("/process", async (req, res) => {
   try {
     const { video_url, prediction_id } = req.body || {};
 
-    if (!video_url || typeof video_url !== "string") {
-      return res
-        .status(400)
-        .json({ success: false, error: "Missing or invalid video_url" });
-    }
-
-    const id =
-      typeof prediction_id === "string"
-        ? prediction_id
-        : crypto.randomBytes(8).toString("hex");
-
-    // 1) Download input video to /tmp
-    const response = await fetch(video_url);
-    if (!response.ok) {
-      const text = await response.text().catch(() => "");
-      return res.status(502).json({
+    if (!video_url) {
+      return res.status(400).json({
         success: false,
-        error: "Failed to download input",
-        status: response.status,
-        detail: text
+        error: "Missing video_url",
       });
     }
 
-    const inputPath = path.join("/tmp", `${id}_input.mp4`);
-    const outputPath = path.join("/tmp", `${id}_output.mp4`);
+    const id = prediction_id || Date.now().toString();
 
-    const fileHandle = await fs.open(inputPath, "w");
-    const fileStream = fileHandle.createWriteStream();
+    const inputPath = path.join(OUTPUT_DIR, `${id}-input.mp4`);
+    const outputPath = path.join(OUTPUT_DIR, `${id}-portrait.mp4`);
 
-    await new Promise((resolve, reject) => {
-      response.body.pipe(fileStream);
-      response.body.on("error", reject);
-      fileStream.on("finish", resolve);
+    console.log("[/process] Downloading source video:", video_url);
+    await downloadFile(video_url, inputPath);
+
+    // FFmpeg: convert to 9:16 portrait, pad/letterbox, normalize SAR
+    const ffmpegArgs = [
+      "-y",
+      "-i",
+      inputPath,
+      "-vf",
+      "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2,setsar=1:1",
+      "-c:v",
+      "libx264",
+      "-preset",
+      "fast",
+      "-crf",
+      "23",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "128k",
+      outputPath,
+    ];
+
+    console.log("[/process] Running ffmpeg:", ffmpegArgs.join(" "));
+    await execFileAsync("ffmpeg", ffmpegArgs);
+
+    // Optional: delete original input to save space
+    fs.unlink(inputPath, (err) => {
+      if (err) console.log("Error deleting temp input:", err.message);
     });
 
-    // 2) Run ffmpeg: convert to 1080x1920 portrait, pad center
-    await new Promise((resolve, reject) => {
-      ffmpeg(inputPath)
-        .videoFilters([
-          "scale=-2:1920", // height 1920, width auto to keep aspect
-          "pad=1080:1920:(ow-iw)/2:(oh-ih)/2" // pad to 1080x1920 centered
-        ])
-        .outputOptions(["-c:v libx264", "-c:a copy"])
-        .on("end", resolve)
-        .on("error", reject)
-        .save(outputPath);
-    });
+    // Build a public URL to the transcoded file
+    const baseUrl =
+      process.env.RENDER_EXTERNAL_URL ||
+      `http://localhost:${process.env.PORT || 10000}`;
+    const fileName = path.basename(outputPath);
+    const fixedUrl = `${baseUrl}/video/${encodeURIComponent(fileName)}`;
 
-    await fileHandle.close();
-
-    videoStore.set(id, outputPath);
-
-    const baseUrl = `${req.protocol}://${req.get("host")}`;
-    const fixedUrl = `${baseUrl}/video/${encodeURIComponent(id)}`;
+    console.log("[/process] Done. fixed_url =", fixedUrl);
 
     return res.json({
       success: true,
-      fixed_url: fixedUrl
+      fixed_url: fixedUrl,
+      prediction_id: id,
+      source_url: video_url,
     });
   } catch (err) {
-    console.error("Transcoder error:", err);
-    return res
-      .status(500)
-      .json({ success: false, error: String(err) });
+    console.error("Error in /process:", err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || String(err),
+    });
   }
 });
 
-/**
- * GET /video/:id
- * Streams the transcoded file from /tmp
- */
-app.get("/video/:id", async (req, res) => {
-  const id = req.params.id;
-  const filePath = videoStore.get(id);
-  if (!filePath) {
-    return res.status(404).json({ error: "Not found" });
-  }
-  res.sendFile(filePath);
-});
+// Serve transcoded videos
+app.use("/video", express.static(OUTPUT_DIR));
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(`Transcoder listening on port ${port}`);
+// IMPORTANT: use Render's PORT env var
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log(`Transcoder listening on port ${PORT}`);
 });
